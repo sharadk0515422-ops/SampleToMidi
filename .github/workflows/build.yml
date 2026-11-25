@@ -1,0 +1,368 @@
+name: Build SampleToMidi VST3
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Create project files
+        shell: bash
+        run: |
+          mkdir -p Source
+          cat > CMakeLists.txt << 'S2M_EOF'
+          cmake_minimum_required(VERSION 3.22)
+          project(SampleToMidi VERSION 1.0.0)
+
+          include(FetchContent)
+          FetchContent_Declare(JUCE
+              GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
+              GIT_TAG 8.0.4
+              GIT_SHALLOW TRUE)
+          FetchContent_MakeAvailable(JUCE)
+
+          juce_add_plugin(SampleToMidi
+              COMPANY_NAME "MyStudio"
+              PLUGIN_MANUFACTURER_CODE Mstd
+              PLUGIN_CODE S2Md
+              FORMATS VST3
+              PRODUCT_NAME "SampleToMidi"
+              IS_SYNTH FALSE
+              NEEDS_MIDI_INPUT FALSE
+              NEEDS_MIDI_OUTPUT TRUE
+              IS_MIDI_EFFECT FALSE
+              COPY_PLUGIN_AFTER_BUILD FALSE)
+
+          target_sources(SampleToMidi PRIVATE
+              Source/PluginProcessor.cpp
+              Source/PluginProcessor.h)
+
+          target_compile_definitions(SampleToMidi PUBLIC
+              JUCE_WEB_BROWSER=0
+              JUCE_USE_CURL=0
+              JUCE_VST3_CAN_REPLACE_VST2=0)
+
+          target_link_libraries(SampleToMidi
+              PRIVATE juce::juce_audio_utils
+              PUBLIC juce::juce_recommended_config_flags
+                     juce::juce_recommended_lto_flags
+                     juce::juce_recommended_warning_flags)
+          S2M_EOF
+          cat > Source/PluginProcessor.h << 'S2M_EOF'
+          #pragma once
+          #include <juce_audio_processors/juce_audio_processors.h>
+          #include <juce_audio_utils/juce_audio_utils.h>
+
+          // SampleToMidi: listens to incoming audio (monophonic) and outputs MIDI notes.
+          class SampleToMidiProcessor : public juce::AudioProcessor
+          {
+          public:
+              SampleToMidiProcessor();
+              ~SampleToMidiProcessor() override = default;
+
+              void prepareToPlay (double sampleRate, int samplesPerBlock) override;
+              void releaseResources() override {}
+              bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
+              void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+
+              juce::AudioProcessorEditor* createEditor() override;
+              bool hasEditor() const override { return true; }
+
+              const juce::String getName() const override { return "SampleToMidi"; }
+              bool acceptsMidi() const override { return false; }
+              bool producesMidi() const override { return true; }
+              bool isMidiEffect() const override { return false; }
+              double getTailLengthSeconds() const override { return 0.0; }
+
+              int getNumPrograms() override { return 1; }
+              int getCurrentProgram() override { return 0; }
+              void setCurrentProgram (int) override {}
+              const juce::String getProgramName (int) override { return {}; }
+              void changeProgramName (int, const juce::String&) override {}
+
+              void getStateInformation (juce::MemoryBlock& destData) override;
+              void setStateInformation (const void* data, int sizeInBytes) override;
+
+              juce::AudioProcessorValueTreeState apvts;
+
+          private:
+              static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
+
+              // returns detected MIDI note (or -1) and the signal level in dB
+              int analyse (float thresholdDb, double minHz, double maxHz, float& levelDb);
+              void handleResult (int detected, float levelDb, int sampleOffset,
+                                 int transpose, bool retrigger, juce::MidiBuffer& midi);
+              void sendNoteOff (int sampleOffset, juce::MidiBuffer& midi);
+
+              static constexpr int ringSize = 4096;
+              static constexpr int ringMask = ringSize - 1;
+              static constexpr int windowSize = 512;   // YIN integration window (decimated samples)
+              static constexpr int hopSize = 128;      // analysis every N decimated samples
+              static constexpr int maxTau = 1000;
+
+              std::vector<float> ring  = std::vector<float> (ringSize, 0.0f);
+              std::vector<float> win   = std::vector<float> (windowSize + maxTau + 8, 0.0f);
+              std::vector<float> diff  = std::vector<float> (maxTau + 8, 0.0f);
+              std::vector<float> cmnd  = std::vector<float> (maxTau + 8, 0.0f);
+
+              int ringPos = 0, decim = 1, decCount = 0, hopCount = 0;
+              float decAccum = 0.0f;
+              double sr = 44100.0, effSr = 44100.0;
+
+              int candNote = -1, candCount = 0;
+              int currentDetected = -1, soundingNote = -1;
+              float prevLevelDb = -100.0f;
+
+              JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SampleToMidiProcessor)
+          };
+          S2M_EOF
+          cat > Source/PluginProcessor.cpp << 'S2M_EOF'
+          #include "PluginProcessor.h"
+
+          SampleToMidiProcessor::SampleToMidiProcessor()
+              : AudioProcessor (BusesProperties()
+                                    .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
+                                    .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+                apvts (*this, nullptr, "PARAMS", createParameterLayout())
+          {
+          }
+
+          juce::AudioProcessorValueTreeState::ParameterLayout SampleToMidiProcessor::createParameterLayout()
+          {
+              using namespace juce;
+              AudioProcessorValueTreeState::ParameterLayout layout;
+
+              layout.add (std::make_unique<AudioParameterFloat> (
+                  ParameterID { "threshold", 1 }, "Threshold",
+                  NormalisableRange<float> (-70.0f, -10.0f, 0.1f), -40.0f,
+                  AudioParameterFloatAttributes().withLabel ("dB")));
+
+              layout.add (std::make_unique<AudioParameterInt> (
+                  ParameterID { "minNote", 1 }, "Lowest Note", 24, 60, 36));
+
+              layout.add (std::make_unique<AudioParameterInt> (
+                  ParameterID { "maxNote", 1 }, "Highest Note", 62, 96, 84));
+
+              layout.add (std::make_unique<AudioParameterInt> (
+                  ParameterID { "transpose", 1 }, "Transpose", -24, 24, 0));
+
+              layout.add (std::make_unique<AudioParameterBool> (
+                  ParameterID { "retrigger", 1 }, "Retrigger On Attack", true));
+
+              layout.add (std::make_unique<AudioParameterBool> (
+                  ParameterID { "thru", 1 }, "Audio Thru", true));
+
+              return layout;
+          }
+
+          void SampleToMidiProcessor::prepareToPlay (double sampleRate, int)
+          {
+              sr = sampleRate;
+              decim = juce::jmax (1, (int) (sr / 12000.0));   // analyse at roughly 12-24 kHz
+              effSr = sr / (double) decim;
+
+              std::fill (ring.begin(), ring.end(), 0.0f);
+              ringPos = decCount = hopCount = 0;
+              decAccum = 0.0f;
+              candNote = -1; candCount = 0;
+              currentDetected = soundingNote = -1;
+              prevLevelDb = -100.0f;
+          }
+
+          bool SampleToMidiProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
+          {
+              return layouts.getMainInputChannelSet()  == juce::AudioChannelSet::stereo()
+                  && layouts.getMainOutputChannelSet() == juce::AudioChannelSet::stereo();
+          }
+
+          int SampleToMidiProcessor::analyse (float thresholdDb, double minHz, double maxHz, float& levelDb)
+          {
+              const int tauMax = juce::jmin ((int) (effSr / minHz), maxTau);
+              const int tauMin = juce::jmax (2, (int) (effSr / maxHz));
+              const int N = windowSize + tauMax;
+
+              for (int i = 0; i < N; ++i)
+                  win[(size_t) i] = ring[(size_t) ((ringPos - N + i) & ringMask)];
+
+              // level of the most recent window
+              float sumSq = 0.0f;
+              for (int i = tauMax; i < N; ++i)
+                  sumSq += win[(size_t) i] * win[(size_t) i];
+              const float rms = std::sqrt (sumSq / (float) windowSize);
+              levelDb = juce::Decibels::gainToDecibels (rms, -100.0f);
+
+              if (levelDb < thresholdDb)
+                  return -1;
+
+              // YIN difference function
+              for (int tau = 1; tau <= tauMax; ++tau)
+              {
+                  float d = 0.0f;
+                  for (int j = 0; j < windowSize; ++j)
+                  {
+                      const float delta = win[(size_t) j] - win[(size_t) (j + tau)];
+                      d += delta * delta;
+                  }
+                  diff[(size_t) tau] = d;
+              }
+
+              // cumulative mean normalised difference
+              cmnd[0] = 1.0f;
+              float running = 0.0f;
+              for (int tau = 1; tau <= tauMax; ++tau)
+              {
+                  running += diff[(size_t) tau];
+                  cmnd[(size_t) tau] = running > 0.0f ? diff[(size_t) tau] * (float) tau / running : 1.0f;
+              }
+
+              // first dip below the YIN threshold, then walk down to the local minimum
+              int best = -1;
+              for (int tau = tauMin; tau < tauMax; ++tau)
+              {
+                  if (cmnd[(size_t) tau] < 0.15f)
+                  {
+                      while (tau + 1 < tauMax && cmnd[(size_t) (tau + 1)] < cmnd[(size_t) tau])
+                          ++tau;
+                      best = tau;
+                      break;
+                  }
+              }
+              if (best < 0)
+                  return -1;
+
+              // parabolic interpolation for a more exact period
+              float tauF = (float) best;
+              if (best > 1 && best < tauMax)
+              {
+                  const float s0 = cmnd[(size_t) (best - 1)];
+                  const float s1 = cmnd[(size_t) best];
+                  const float s2 = cmnd[(size_t) (best + 1)];
+                  const float denom = s0 - 2.0f * s1 + s2;
+                  if (std::abs (denom) > 1.0e-9f)
+                      tauF += 0.5f * (s0 - s2) / denom;
+              }
+
+              const double freq = effSr / (double) tauF;
+              const double midiNote = 69.0 + 12.0 * std::log2 (freq / 440.0);
+              return (int) std::lround (midiNote);
+          }
+
+          void SampleToMidiProcessor::sendNoteOff (int sampleOffset, juce::MidiBuffer& midi)
+          {
+              if (soundingNote >= 0)
+                  midi.addEvent (juce::MidiMessage::noteOff (1, soundingNote), sampleOffset);
+              soundingNote = -1;
+          }
+
+          void SampleToMidiProcessor::handleResult (int detected, float levelDb, int sampleOffset,
+                                                    int transpose, bool retrigger, juce::MidiBuffer& midi)
+          {
+              // require the same result for two hops in a row before acting (removes flicker)
+              if (detected == candNote) ++candCount;
+              else { candNote = detected; candCount = 1; }
+
+              const bool attack = retrigger && currentDetected >= 0 && detected == currentDetected
+                                  && (levelDb - prevLevelDb) > 6.0f;
+
+              if ((candCount >= 2 && candNote != currentDetected) || attack)
+              {
+                  sendNoteOff (sampleOffset, midi);
+                  currentDetected = candNote;
+
+                  if (candNote >= 0)
+                  {
+                      const int note = juce::jlimit (0, 127, candNote + transpose);
+                      const int vel  = juce::jlimit (1, 127, (int) juce::jmap (juce::jlimit (-40.0f, 0.0f, levelDb),
+                                                                              -40.0f, 0.0f, 30.0f, 127.0f));
+                      midi.addEvent (juce::MidiMessage::noteOn (1, note, (juce::uint8) vel), sampleOffset);
+                      soundingNote = note;
+                  }
+              }
+
+              prevLevelDb = levelDb;
+          }
+
+          void SampleToMidiProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi)
+          {
+              juce::ScopedNoDenormals noDenormals;
+              midi.clear();
+
+              const int numChannels = juce::jmin (buffer.getNumChannels(), 2);
+              const int numSamples  = buffer.getNumSamples();
+
+              const float thresholdDb = *apvts.getRawParameterValue ("threshold");
+              const int   minNote     = (int) *apvts.getRawParameterValue ("minNote");
+              const int   maxNote     = (int) *apvts.getRawParameterValue ("maxNote");
+              const int   transpose   = (int) *apvts.getRawParameterValue ("transpose");
+              const bool  retrigger   = *apvts.getRawParameterValue ("retrigger") > 0.5f;
+              const bool  thru        = *apvts.getRawParameterValue ("thru") > 0.5f;
+
+              const double minHz = juce::MidiMessage::getMidiNoteInHertz (minNote);
+              const double maxHz = juce::MidiMessage::getMidiNoteInHertz (maxNote);
+
+              for (int s = 0; s < numSamples; ++s)
+              {
+                  float mono = 0.0f;
+                  for (int ch = 0; ch < numChannels; ++ch)
+                      mono += buffer.getReadPointer (ch)[s];
+                  mono /= (float) juce::jmax (1, numChannels);
+
+                  decAccum += mono;
+                  if (++decCount >= decim)
+                  {
+                      ring[(size_t) ringPos] = decAccum / (float) decim;
+                      ringPos = (ringPos + 1) & ringMask;
+                      decAccum = 0.0f;
+                      decCount = 0;
+
+                      if (++hopCount >= hopSize)
+                      {
+                          hopCount = 0;
+                          float levelDb = -100.0f;
+                          int detected = analyse (thresholdDb, minHz, maxHz, levelDb);
+
+                          if (detected >= 0 && (detected < minNote || detected > maxNote))
+                              detected = -1;
+
+                          handleResult (detected, levelDb, s, transpose, retrigger, midi);
+                      }
+                  }
+              }
+
+              if (! thru)
+                  buffer.clear();
+          }
+
+          juce::AudioProcessorEditor* SampleToMidiProcessor::createEditor()
+          {
+              return new juce::GenericAudioProcessorEditor (*this);
+          }
+
+          void SampleToMidiProcessor::getStateInformation (juce::MemoryBlock& destData)
+          {
+              if (auto xml = apvts.copyState().createXml())
+                  copyXmlToBinary (*xml, destData);
+          }
+
+          void SampleToMidiProcessor::setStateInformation (const void* data, int sizeInBytes)
+          {
+              if (auto xml = getXmlFromBinary (data, sizeInBytes))
+                  if (xml->hasTagName (apvts.state.getType()))
+                      apvts.replaceState (juce::ValueTree::fromXml (*xml));
+          }
+
+          juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
+          {
+              return new SampleToMidiProcessor();
+          }
+          S2M_EOF
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Upload plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: SampleToMidi-VST3-Windows
+          path: build/SampleToMidi_artefacts/Release/VST3/
